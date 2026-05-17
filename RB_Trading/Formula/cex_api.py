@@ -42,11 +42,17 @@ class CEXConnector:
             
             self.exchange = exchange_class(config)
             
+            # Загружаем рынки (нужно для OKX)
+            if hasattr(self.exchange, 'load_markets'):
+                self.exchange.load_markets()
+            
         except AttributeError:
             print(f"{Fore.RED}✗ Биржа {self.exchange_name} не поддерживается{Style.RESET_ALL}")
             self.exchange = None
         except Exception as e:
             print(f"{Fore.RED}✗ Ошибка инициализации биржи: {e}{Style.RESET_ALL}")
+            import traceback
+            traceback.print_exc()
             self.exchange = None
     
     def test_connection(self):
@@ -116,17 +122,7 @@ class CEXConnector:
             return []
     
     def fetch_all_historical_data(self, symbol, timeframe='1d', start_date=None):
-        """
-        Получить всю историческую информацию по свечам
-        
-        Args:
-            symbol: Торговая пара
-            timeframe: Таймфрейм
-            start_date: Дата начала (datetime объект или timestamp в мс)
-        
-        Returns:
-            List of all candles
-        """
+        """Получить всю историческую информацию по свечам"""
         if not self.exchange:
             print(f"{Fore.RED}✗ Биржа не инициализирована{Style.RESET_ALL}")
             return []
@@ -134,13 +130,11 @@ class CEXConnector:
         all_candles = []
         
         try:
-            # Если start_date - datetime объект, конвертируем в timestamp
             if isinstance(start_date, datetime):
                 since = int(start_date.timestamp() * 1000)
             elif start_date:
                 since = start_date
             else:
-                # По умолчанию берем с начала 2020 года
                 since = int(datetime(2020, 1, 1).timestamp() * 1000)
             
             print(f"{Fore.YELLOW}⏳ Загрузка исторических данных...{Style.RESET_ALL}")
@@ -152,13 +146,10 @@ class CEXConnector:
                     break
                 
                 all_candles.extend(candles)
-                
-                # Обновляем since для следующей итерации
                 since = candles[-1][0] + 1
                 
                 print(f"{Fore.CYAN}  Загружено {len(all_candles)} свечей...{Style.RESET_ALL}", end='\r')
                 
-                # Если получили меньше 1000, значит это все данные
                 if len(candles) < 1000:
                     break
             
@@ -182,13 +173,7 @@ class CEXConnector:
             return None
     
     def display_candle_data(self, candles, limit=10):
-        """
-        Вывести данные свечей в терминал
-        
-        Args:
-            candles: Список свечей
-            limit: Количество свечей для вывода
-        """
+        """Вывести данные свечей в терминал"""
         if not candles:
             print(f"{Fore.YELLOW}⚠ Нет данных для отображения{Style.RESET_ALL}")
             return
@@ -197,14 +182,12 @@ class CEXConnector:
         print(f"{Fore.CYAN}{'Дата/Время':<20} {'Open':<15} {'High':<15} {'Low':<15} {'Close':<15} {'Volume':<15}")
         print(f"{Fore.CYAN}{'─'*120}{Style.RESET_ALL}")
         
-        # Показываем только последние limit свечей
         display_candles = candles[-limit:] if len(candles) > limit else candles
         
         for candle in display_candles:
             timestamp, open_price, high, low, close_price, volume = candle
             dt = datetime.fromtimestamp(timestamp / 1000)
             
-            # Определяем цвет для close (зеленый если выросла, красный если упала)
             close_color = Fore.GREEN if close_price >= open_price else Fore.RED
             
             print(f"{Fore.WHITE}{dt.strftime('%Y-%m-%d %H:%M:%S'):<20} "
@@ -219,16 +202,11 @@ class CEXConnector:
 
 # Пример использования
 if __name__ == "__main__":
-    # Создание коннектора (без API ключей для публичных данных)
     connector = CEXConnector()
     
-    # Тестирование подключения
     if connector.test_connection():
         print(f"{Fore.GREEN}✓ Успешное подключение к бирже{Style.RESET_ALL}")
-        
-        # Получение данных
         candles = connector.fetch_ohlcv('BTC/USDT', '1h', 20)
-        
         if candles:
             connector.display_candle_data(candles)
     else:

@@ -7,8 +7,8 @@
 import sys
 from colorama import Fore, Back, Style, init
 from cex_api import CEXConnector
-from rb_formula import RBFormula
-from roger_formula import RogerFormula
+from unified_formula import RBFormula
+from unified_formula import RogerFormula
 import psycopg2
 from datetime import datetime
 

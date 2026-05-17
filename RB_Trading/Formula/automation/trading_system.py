@@ -5,8 +5,9 @@ Trading System - Полная система автоматизации торг
 
 import sys
 import os
+import signal
+import threading
 
-# Добавляем родительскую папку в путь для импорта
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import time
@@ -14,7 +15,7 @@ import psycopg2
 from datetime import datetime
 from colorama import Fore, Style, init
 from cex_api import CEXConnector
-from roger_formula import RogerFormula
+from unified_formula import RogerFormula
 from trade_journal import TradeJournal
 from telegram_notifier import TelegramNotifier
 
@@ -25,21 +26,19 @@ class TradingSystem:
     """Полная торговая система с автоматизацией"""
     
     def __init__(self, config):
-        """
-        Args:
-            config: Конфигурация системы (dict)
-        """
         self.config = config
+        self._running = False
+        self._stop_event = threading.Event()
         
         # Подключение к бирже
         self.cex = CEXConnector()
         
         # Подключение к БД
         self.conn = psycopg2.connect(
-            dbname="trading_db",
-            user="postgres",
-            host="/var/run/postgresql",
-            port="5432"
+            dbname=config.get('db_name', 'trading_db'),
+            user=config.get('db_user', 'postgres'),
+            host=config.get('db_host', '/var/run/postgresql'),
+            port=config.get('db_port', '5432')
         )
         
         # Модули
@@ -47,11 +46,22 @@ class TradingSystem:
         self.journal = TradeJournal(self.conn)
         
         # Telegram (опционально)
-        telegram_token = config.get('telegram_token')
-        telegram_chat = config.get('telegram_chat')
-        self.telegram = TelegramNotifier(telegram_token, telegram_chat)
+        self.telegram = TelegramNotifier(
+            config.get('telegram_token'),
+            config.get('telegram_chat')
+        )
+        
+        # Сигналы для graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
         
         self.print_header()
+    
+    def _signal_handler(self, signum, frame):
+        """Обработчик сигналов для graceful shutdown"""
+        print(f"\n{Fore.YELLOW}Получен сигнал остановки...{Style.RESET_ALL}")
+        self._stop_event.set()
+        self._running = False
     
     def print_header(self):
         """Показать заголовок системы"""
@@ -67,36 +77,32 @@ class TradingSystem:
         print(f"{Fore.WHITE}Telegram:{Style.RESET_ALL}    {Fore.GREEN if self.telegram.enabled else Fore.RED}{'Вкл' if self.telegram.enabled else 'Выкл'}{Style.RESET_ALL}\n")
     
     def scan_all_symbols(self):
-        """Сканировать все монеты"""
+        """Сканировать все монеты — возвращает список найденных сигналов"""
         signals_found = []
         
         for symbol in self.config['symbols']:
             try:
-                # Загружаем данные
                 candles = self.cex.fetch_ohlcv(symbol, self.config['timeframe'], 100)
-                
                 if not candles:
                     continue
                 
-                # Сохраняем последние 10 свечей
-                self.save_candles(symbol, candles[-10:])
+                self._save_candles(symbol, candles[-10:])
                 
-                # Анализируем
                 results = self.roger.calculate(self.conn, symbol, self.config['timeframe'], 100)
-                
                 if not results:
                     continue
                 
-                # Ищем активные сигналы
-                signals = results['signals']
-                active = [s for s in signals if s['type'] in ['LONG', 'SHORT', 'LONG (Скальпинг)', 'SHORT (Скальпинг)']]
+                signals = results.get('signals', [])
+                active = [s for s in signals if isinstance(s, dict) and s.get('type') in [
+                    'LONG', 'SHORT', 'LONG (Скальпинг)', 'SHORT (Скальпинг)'
+                ]]
                 
                 if active:
                     signals_found.append({
                         'symbol': symbol,
                         'signals': active,
-                        'current_candle': results['current_candle'],
-                        'rb_formula': results['rb_formula']
+                        'current_candle': results.get('current_candle', {}),
+                        'rb_formula': results.get('rb_formula', {})
                     })
                     
             except Exception as e:
@@ -104,19 +110,22 @@ class TradingSystem:
         
         return signals_found
     
-    def save_candles(self, symbol, candles):
-        """Сохранить свечи в БД"""
+    def _save_candles(self, symbol, candles):
+        """Сохранить свечи в БД (batch insert)"""
         cursor = self.conn.cursor()
         
+        values = []
         for candle in candles:
             timestamp, open_p, high, low, close_p, volume = candle
             dt = datetime.utcfromtimestamp(timestamp / 1000)
-            
-            cursor.execute("""
-                INSERT INTO candles (symbol, timeframe, timestamp, datetime, high, low, open, close, volume)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (symbol, timeframe, timestamp) DO NOTHING
-            """, (symbol, self.config['timeframe'], timestamp, dt, high, low, open_p, close_p, volume))
+            values.append((symbol, self.config['timeframe'], timestamp, dt, high, low, open_p, close_p, volume))
+        
+        # Batch insert — быстрее, чем по одной
+        cursor.executemany("""
+            INSERT INTO candles (symbol, timeframe, timestamp, datetime, high, low, open, close, volume)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, timeframe, timestamp) DO NOTHING
+        """, values)
         
         self.conn.commit()
         cursor.close()
@@ -129,36 +138,31 @@ class TradingSystem:
             signals = result['signals']
             
             for signal in signals:
-                signal_type = signal['type']
+                signal_type = signal.get('type', 'UNKNOWN')
                 
-                # Цвет
                 if 'LONG' in signal_type:
                     color = Fore.GREEN
                     emoji = '🟢'
-                else:
+                elif 'SHORT' in signal_type:
                     color = Fore.RED
                     emoji = '🔴'
+                else:
+                    color = Fore.YELLOW
+                    emoji = '⚪'
                 
                 print(f"\n{color}{'─'*80}")
                 print(f"{emoji} {signal_type} - {symbol}")
                 print(f"{color}{'─'*80}{Style.RESET_ALL}")
                 
-                print(f"{Fore.WHITE}Время:{Style.RESET_ALL}    {Fore.MAGENTA}{candle['datetime']}{Style.RESET_ALL}")
-                print(f"{Fore.WHITE}Цена:{Style.RESET_ALL}     {Fore.CYAN}{candle['close']:.8f}{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Время:{Style.RESET_ALL}    {Fore.MAGENTA}{candle.get('datetime', 'N/A')}{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Цена:{Style.RESET_ALL}     {Fore.CYAN}{candle.get('close', 0):.8f}{Style.RESET_ALL}")
                 
-                # Детали сигнала
                 for key, value in signal.items():
                     if key not in ['type', 'strategy']:
                         print(f"{Fore.YELLOW}{key}:{Style.RESET_ALL} {value}")
                 
-                # Отправка в Telegram
                 if self.telegram.enabled:
-                    self.telegram.send_signal(
-                        symbol,
-                        signal_type,
-                        signal,
-                        candle['close']
-                    )
+                    self.telegram.send_signal(symbol, signal_type, signal, candle.get('close', 0))
                 
                 print(f"{color}{'─'*80}{Style.RESET_ALL}")
     
@@ -170,63 +174,58 @@ class TradingSystem:
         print(f"{Fore.CYAN}СТАТИСТИКА ЗА СЕГОДНЯ")
         print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}\n")
         
-        print(f"{Fore.WHITE}Сделок:{Style.RESET_ALL}       {Fore.CYAN}{stats['total_trades']}{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}Успешных:{Style.RESET_ALL}     {Fore.GREEN}{stats['wins']}{Style.RESET_ALL}")
-        print(f"{Fore.RED}Убыточных:{Style.RESET_ALL}    {Fore.RED}{stats['losses']}{Style.RESET_ALL}")
-        print(f"{Fore.MAGENTA}Открытых:{Style.RESET_ALL}     {Fore.MAGENTA}{stats['open_trades']}{Style.RESET_ALL}\n")
+        print(f"{Fore.WHITE}Сделок:{Style.RESET_ALL}       {Fore.CYAN}{stats.get('total_trades', 0)}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}Успешных:{Style.RESET_ALL}     {Fore.GREEN}{stats.get('wins', 0)}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Убыточных:{Style.RESET_ALL}    {Fore.RED}{stats.get('losses', 0)}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}Открытых:{Style.RESET_ALL}     {Fore.MAGENTA}{stats.get('open_trades', 0)}{Style.RESET_ALL}\n")
         
-        profit_color = Fore.GREEN if stats['total_profit'] > 0 else Fore.RED
-        print(f"{Fore.WHITE}Профит:{Style.RESET_ALL}       {profit_color}{stats['total_profit']:+.2f} USDT{Style.RESET_ALL}\n")
+        total_profit = stats.get('total_profit', 0)
+        profit_color = Fore.GREEN if total_profit > 0 else Fore.RED
+        print(f"{Fore.WHITE}Профит:{Style.RESET_ALL}       {profit_color}{total_profit:+.2f} USDT{Style.RESET_ALL}\n")
         
-        # Прогресс к цели
-        target = self.config['daily_target']
-        progress = (stats['total_profit'] / target * 100) if target > 0 else 0
+        target = self.config.get('daily_target', 100)
+        progress = (total_profit / target * 100) if target > 0 else 0
+        progress = min(progress, 100)
         
         print(f"{Fore.YELLOW}Цель:{Style.RESET_ALL}         ${target}")
         print(f"{Fore.YELLOW}Прогресс:{Style.RESET_ALL}     {progress:.1f}%")
         
-        # Прогресс-бар
         bar_length = 40
-        filled = int(bar_length * min(progress, 100) / 100)
+        filled = int(bar_length * progress / 100)
         bar = '█' * filled + '░' * (bar_length - filled)
         print(f"{Fore.CYAN}[{bar}]{Style.RESET_ALL}\n")
-        
         print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}\n")
     
     def run_continuous(self):
-        """Непрерывный мониторинг"""
+        """Непрерывный мониторинг с возможностью graceful остановки"""
         print(f"{Fore.GREEN}✓ Система запущена! Ctrl+C для остановки{Style.RESET_ALL}\n")
         
+        self._running = True
         scan_count = 0
         
-        try:
-            while True:
-                scan_count += 1
-                now = datetime.now().strftime("%H:%M:%S")
-                
-                print(f"{Fore.CYAN}{'='*80}")
-                print(f"Сканирование #{scan_count} - {now}")
-                print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}\n")
-                
-                # Сканируем все монеты
-                signals = self.scan_all_symbols()
-                
-                if signals:
-                    print(f"{Fore.GREEN}✓ Найдено {len(signals)} сигналов!{Style.RESET_ALL}")
-                    self.show_signals(signals)
-                else:
-                    print(f"{Fore.YELLOW}○ Сигналов не обнаружено{Style.RESET_ALL}")
-                
-                # Показываем статистику
-                self.show_dashboard()
-                
-                # Ждём 5 минут
-                print(f"{Fore.CYAN}Следующее сканирование через 5 минут...{Style.RESET_ALL}\n")
-                time.sleep(300)
-                
-        except KeyboardInterrupt:
-            print(f"\n{Fore.YELLOW}Система остановлена{Style.RESET_ALL}")
-            self.cleanup()
+        while self._running and not self._stop_event.is_set():
+            scan_count += 1
+            now = datetime.now().strftime("%H:%M:%S")
+            
+            print(f"{Fore.CYAN}{'='*80}")
+            print(f"Сканирование #{scan_count} - {now}")
+            print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}\n")
+            
+            signals = self.scan_all_symbols()
+            
+            if signals:
+                print(f"{Fore.GREEN}✓ Найдено {len(signals)} сигналов!{Style.RESET_ALL}")
+                self.show_signals(signals)
+            else:
+                print(f"{Fore.YELLOW}○ Сигналов не обнаружено{Style.RESET_ALL}")
+            
+            self.show_dashboard()
+            
+            # Ждём с проверкой флага остановки (не блокирует намертво)
+            print(f"{Fore.CYAN}Следующее сканирование через 5 минут...{Style.RESET_ALL}\n")
+            self._stop_event.wait(timeout=300)
+        
+        self.cleanup()
     
     def run_menu(self):
         """Режим с меню"""
@@ -243,7 +242,7 @@ class TradingSystem:
             print(f"{Fore.WHITE}6.{Style.RESET_ALL} Отправить отчёт в Telegram")
             print(f"{Fore.WHITE}0.{Style.RESET_ALL} Выход\n")
             
-            choice = input(f"{Fore.CYAN}Выбери опцию: {Style.RESET_ALL}")
+            choice = input(f"{Fore.CYAN}Выбери опцию: {Style.RESET_ALL}").strip()
             
             if choice == '1':
                 signals = self.scan_all_symbols()
@@ -256,10 +255,10 @@ class TradingSystem:
                 self.run_continuous()
             
             elif choice == '3':
-                self.add_trade_manually()
+                self._add_trade_manually()
             
             elif choice == '4':
-                self.close_trade_manually()
+                self._close_trade_manually()
             
             elif choice == '5':
                 self.journal.show_daily_report()
@@ -274,17 +273,18 @@ class TradingSystem:
             
             elif choice == '0':
                 print(f"\n{Fore.CYAN}До свидания!{Style.RESET_ALL}\n")
+                self.cleanup()
                 break
     
-    def add_trade_manually(self):
+    def _add_trade_manually(self):
         """Добавить сделку вручную"""
         print(f"\n{Fore.CYAN}Добавление сделки{Style.RESET_ALL}\n")
         
         symbol = input("Символ: ").upper()
         direction = input("Направление (LONG/SHORT): ").upper()
-        entry = float(input("Цена входа: "))
-        target = float(input("Целевая цена: "))
-        stop = float(input("Стоп-лосс: "))
+        entry = float(input("Цена входа: ") or 0)
+        target = float(input("Целевая цена: ") or 0)
+        stop = float(input("Стоп-лосс: ") or 0)
         position = float(input(f"Размер позиции (по умолчанию {self.config['capital']}): ") or self.config['capital'])
         
         self.journal.add_trade(
@@ -297,9 +297,8 @@ class TradingSystem:
             leverage=self.config['leverage']
         )
     
-    def close_trade_manually(self):
+    def _close_trade_manually(self):
         """Закрыть сделку вручную"""
-        # Показываем открытые сделки
         open_trades = self.journal.get_open_trades()
         
         if not open_trades:
@@ -317,41 +316,20 @@ class TradingSystem:
     
     def cleanup(self):
         """Очистка ресурсов"""
+        self._running = False
+        self._stop_event.set()
         if self.conn:
             self.conn.close()
         print(f"{Fore.GREEN}✓ Ресурсы освобождены{Style.RESET_ALL}")
 
 
-# Главный запуск
+# ============================================================
+# Конфигурация (вынесена отдельно)
+# ============================================================
+
+from config import get_config
+
 if __name__ == "__main__":
-    # Конфигурация
-    config = {
-        'symbols': [
-            'BTC/USDT',
-            'ETH/USDT',
-            'SOL/USDT',
-            'BNB/USDT',
-            'AVAX/USDT'
-        ],
-        'timeframe': '5m',
-        'capital': 100,
-        'leverage': 3,
-        'daily_target': 100,
-        'telegram_token': None,  # Заполни из telegram_config.txt
-        'telegram_chat': None    # Заполни из telegram_config.txt
-    }
-    
-    # Загружаем Telegram настройки если есть
-    try:
-        with open('telegram_config.txt', 'r') as f:
-            for line in f:
-                if line.startswith('BOT_TOKEN='):
-                    config['telegram_token'] = line.split('=')[1].strip()
-                elif line.startswith('CHAT_ID='):
-                    config['telegram_chat'] = line.split('=')[1].strip()
-    except:
-        pass
-    
-    # Запуск системы
+    config = get_config()
     system = TradingSystem(config)
     system.run_menu()
